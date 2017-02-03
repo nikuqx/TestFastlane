@@ -1,0 +1,16 @@
+machine:
+  timezone: Asia/Tokyo
+  xcode:
+    version: "8.2"
+dependencies:
+  pre:
+    - brew update
+    - brew install swiftlint
+test:
+  override:
+    - bundle exec fastlane analyze
+deployment:
+  master:
+    branch: master
+    commands:
+      - bundle exec fastlane beta

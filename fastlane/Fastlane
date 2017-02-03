@@ -1,0 +1,129 @@
+fastlane_version '2.14.1'
+
+default_platform :ios
+
+# You need to set your project values.
+workspace_name = 'TestFastlane.xcworkspace'
+scheme_name = 'AdhocDebug'
+deploygate_user_name = 'momons'
+project_name = 'TestFastlane'
+
+# And you need to set environment variables.
+DEPLOY_GATE_KEY = '751a893ac33ec36b385710b5ac4cd48187db99ce'
+GITHUB_ACCESS_TOKEN = '153688d1d864cee17985e9119a40fe8b51cb21fe'
+KEY_PASSWORD = 'Fastlane1234!'
+
+platform :ios do
+  before_all do
+    add_keychain if is_ci?
+  end
+
+  after_all do
+    remove_keychain if is_ci?
+  end
+
+  desc 'Submit a new Beta Build to DeployGate'
+  lane :beta do
+    gym(
+      workspace: workspace_name,
+      scheme: scheme_name,
+      output_name: "#{project_name}.ipa"
+    )
+
+    Helper.log.info 'Save Artifacts'
+    sh "cp #{lane_context[SharedValues::IPA_OUTPUT_PATH]} $CIRCLE_ARTIFACTS"
+
+    message = "Commit: #{ENV['CIRCLE_SHA1']} / #{last_git_commit[:message]}, Build: #{ENV['CIRCLE_BUILD_NUM']}"
+    deploygate(
+      api_token: ENV['DEPLOY_GATE_KEY'],
+      user: deploygate_user_name,
+      ipa: lane_context[SharedValues::IPA_OUTPUT_PATH],
+      message: message
+    )
+
+    set_github_release(
+      repository_name: "#{ENV['CIRCLE_PROJECT_USERNAME']}/#{ENV['CIRCLE_PROJECT_REPONAME']}",
+      api_token: ENV['GITHUB_ACCESS_TOKEN'],
+      name: "Build: #{ENV['CIRCLE_BUILD_NUM']}",
+      commitish: ENV['CIRCLE_SHA1'],
+      description: '',
+      tag_name: "v#{Time.now.strftime('%Y%m%d%H%M%S')}",
+      is_prerelease: true,
+      upload_assets: [lane_context[SharedValues::IPA_OUTPUT_PATH]]
+    )
+  end
+
+  desc 'Analyze codes'
+  desc 'This may comment to pull request'
+  lane :analyze do
+    xcode_analyze
+    lint
+  end
+
+  private_lane :xcode_analyze do
+    xcodebuild(
+      analyze: true,
+      scheme: scheme_name,
+      workspace: workspace_name,
+      derivedDataPath: './derivedData'
+    )
+
+    sh <<-EOS
+cd ../;
+ios_analytics translate --appName="#{project_name}" --derivedData="./derivedData" \
+    | checkstyle_filter-git diff origin/master \
+    | saddler report --require saddler/reporter/github --reporter #{reporter}
+    EOS
+  end
+
+  private_lane :lint do
+    swiftlint(
+      output_file: 'swiftlint.result.json',
+      reporter: 'json'
+    )
+
+    sh 'cp ../swiftlint.result.json $CIRCLE_ARTIFACTS/'
+
+    sh <<-EOS
+cd ../;
+cat swiftlint.result.json \
+    | swiftlint_translate_checkstyle_format translate \
+    | checkstyle_filter-git diff origin/master \
+    | saddler report --require saddler/reporter/github --reporter #{reporter}
+    EOS
+  end
+
+  private_lane :add_keychain do
+    create_keychain(
+      name: 'ios-build.keychain',
+      password: SecureRandom.uuid,
+      default_keychain: true,
+      unlock: true,
+      timeout: 3600,
+      lock_when_sleeps: true
+    )
+    import_certificate keychain_name: 'ios-build.keychain', certificate_path: 'fastlane/cert/apple.cer'
+    Dir.glob('cert/*.p12').each do |cert_file|
+      import_certificate keychain_name: 'ios-build.keychain', certificate_path: 'fastlane/' + cert_file, certificate_password: ENV['KEY_PASSWORD']
+    end
+
+    Dir.glob('cert/*.mobileprovision').each do |provisioning_file|
+      FastlaneCore::ProvisioningProfile.install(provisioning_file)
+    end
+  end
+
+  private_lane :remove_keychain do
+    delete_keychain(
+      name: 'ios-build.keychain'
+    )
+    sh "rm -f \"#{FastlaneCore::ProvisioningProfile.profiles_path}*\""
+  end
+
+  def reporter
+    if ENV['CI_PULL_REQUEST'].nil? || ENV['CI_PULL_REQUEST'].empty?
+      'Saddler::Reporter::Github::CommitReviewComment'
+    else
+      'Saddler::Reporter::Github::PullRequestReviewComment'
+    end
+  end
+end
